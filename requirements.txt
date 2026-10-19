@@ -1,0 +1,10 @@
+edge-tts
+feedparser
+ddgs
+numpy
+Pillow
+PyAudio
+pywin32
+qrcode[pil]
+requests
+SpeechRecognition

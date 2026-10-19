@@ -1,0 +1,41 @@
+# 秘密の情報 (スマホ用の合言葉など) と個人の会話記録
+settings.json
+jarvis.log
+
+# 作業用・自動で作られるもの
+backups/
+__pycache__/
+*.pyc
+dist/
+sounds/*.wav
+tools/*.wav
+memory/*.broken-*.json
+
+# 学習記憶は Google ドライブ (マイドライブ\JARVIS_memory) で管理する。
+# memory/ は Google ドライブにつながらないときの一時的な置き場所
+memory/
+
+# JARVIS が作った会話の番号 (お掃除用)
+jarvis_sessions.txt
+
+# 知識ベースは Google ドライブ (マイドライブ\JARVIS_knowledge) で管理する。
+# knowledge/ は Google ドライブにつながらないときの一時的な置き場所
+knowledge/
+
+# チャットに添付した画像 (30日で自動で消す)
+attachments/
+
+# JARVIS が作った n8n ワークフローの JSON (自動で作られる成果物)
+/workflows/
+
+# 起動時に読み上げるお知らせ (読んだら消える)
+notice.txt
+
+# commit で再起動の確認が必要かどうかのしるし (確認したら消える)
+restart_pending.flag
+
+# 再起動の直前に保存する会話の続き (起動時に読み込んだら消える)
+restart_state.json
+
+# 途中で止まった改修の再開情報 (続きから再開したら消える)
+dev_resume.json
