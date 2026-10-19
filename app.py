@@ -396,6 +396,16 @@ PHRASE_TIME_LIMIT = load_settings().get("phrase_time_limit", DEFAULT_PHRASE_TIME
 recognizer.non_speaking_duration = 0.6  # 話し始めの前の音も少し残して、出だしを切らない
 last_calibrated = 0  # 最後にキャリブレーションした時刻 (time.time())
 RECALIBRATE_INTERVAL = 300  # 5分ごとに再キャリブレーション (雑音レベルの変化に追従するため)
+
+# 会話の調子をはかるカウンタ (聞き取れた/聞き取れなかった/文の途中を継ぎ足した 回数)。
+# conversation_health_monitor が定期的に見て、待ち時間やマイク感度を自動で調整する。
+recog_stats = {"ok": 0, "unknown": 0, "stitched": 0}
+recog_stats_lock = threading.Lock()
+
+
+def _bump_recog(key):
+    with recog_stats_lock:
+        recog_stats[key] += 1
 busy = threading.Lock()
 # マイク (PortAudio) はスレッドセーフでないため、同時に2つ以上のストリームを開くと
 # ネイティブクラッシュ (ヒープ破損) で JARVIS が無言で落ちる。バージイン監視と聞き取りが
@@ -474,6 +484,7 @@ def listen(prompt="話してください...", timeout=5, quiet=False, follow_up=
             audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=PHRASE_TIME_LIMIT)
         ui(status.set, "認識中...")
         text = recognizer.recognize_google(audio, language="ja-JP")
+        tries = 0  # follow_up で続きを継ぎ足した回数 (会話の調子の指標)
         if follow_up:
             # 言いさし (「〜方が」「〜を」など) で切れていたら、続きを聞き足す。
             # 文法的に途中なので、考える間が長くても取りこぼさないよう pause_threshold と同じだけ待つ。
@@ -491,6 +502,9 @@ def listen(prompt="話してください...", timeout=5, quiet=False, follow_up=
                 except (sr.WaitTimeoutError, OSError):
                     break  # 無言が続いた = 言い終えたとみなす
         if announce:
+            _bump_recog("ok")
+            if tries > 0:
+                _bump_recog("stitched")
             ui(heard.set, short(f"あなた: {text}"))
             log(f"あなた: {text}")
         return text
@@ -498,6 +512,8 @@ def listen(prompt="話してください...", timeout=5, quiet=False, follow_up=
         if not quiet:
             ui(status.set, "声が聞こえませんでした")
     except sr.UnknownValueError:
+        if announce:
+            _bump_recog("unknown")  # 何か聞こえたが文字にできなかった = 聞き取りの調子の指標
         if not quiet:
             ui(status.set, "聞き取れませんでした")
     except sr.RequestError as e:
@@ -716,8 +732,13 @@ def attention_intent(text):
         return None
     label, confidence = attention_router.classify(text)
     log(f"Self-Attention意図分類: {label} ({confidence:.2f})")
-    if confidence >= 0.92:
-        return label
+    # 自動操作(operate)は画面を乗っ取る重い処理で、誤爆すると会話が一番かみ合わなくなる。
+    # 明示の合図(OPERATE_WORDS)は呼び出し元で既に拾っているので、ここに来た operate は
+    # 分類器がいくら高確信でも採用せず、会話として扱う(本当に操作が要るなら会話のAIが促す)。
+    # 調査(work)は、短い相づち・雑談を巻き込まないよう、確信が非常に高く かつ ある程度の長さの
+    # 依頼のときだけ採用する。それ以外は会話に倒し、記憶や文脈を生かして自然に答える。
+    if label == "work" and confidence >= 0.97 and len(text) >= 15:
+        return "work"
     rule_label = _rule_based_intent(text)
     if rule_label:
         memory_store.add_intent_example(text, rule_label)
@@ -1131,12 +1152,30 @@ def confirm_restart():
 RESTART_STATE_FILE = Path(__file__).with_name("restart_state.json")
 
 
+RESTART_RESTORE_WINDOW = 1800  # 30分以内の再起動なら、前の会話を続きとして復元する
+
+
 def save_restart_state():
-    """再起動の直前に、会話の続きを話せるように session_id と chat_log を保存する"""
-    state = {"chat_log": chat_log}
-    if assistant is not None and assistant.session_id:
-        state["session_id"] = assistant.session_id
-    RESTART_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    """会話の続きを話せるように、直近の会話と学習中フラグを保存する。
+    停止バット・プロセス終了など強制終了でも残るよう、動作中は定期的にも自動保存する。
+    続きは復元した会話(chat_log → recent_context)から文脈として渡し直すので、
+    プロバイダ(Gemini/Claude/Ollama)をまたいでも続く。session_id の引き継ぎには依存しない。"""
+    if not chat_log:
+        return
+    state = {"chat_log": chat_log[-40:], "saved_at": time.time()}
+    if assistant is not None:
+        state["security_thread"] = assistant._security_thread
+    try:
+        RESTART_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def autosave_restart_state():
+    """強制終了でも直近の会話が失われないよう、動いている間は定期的に保存し続ける。"""
+    while True:
+        threading.Event().wait(30)
+        save_restart_state()
 
 
 def restart():
@@ -1161,10 +1200,22 @@ def restore_state():
     except (OSError, json.JSONDecodeError):
         state = {}
     RESTART_STATE_FILE.unlink(missing_ok=True)
-    for who, text in state.get("chat_log", []):
+    # 長時間空いた後の起動は「続き」にせず、新しい会話として始める (古い文脈を蒸し返さない)
+    if time.time() - state.get("saved_at", 0) > RESTART_RESTORE_WINDOW:
+        return
+    log_entries = state.get("chat_log", [])
+    if not log_entries:
+        return
+    for who, text in log_entries:
         add_chat(who, text)
-    if assistant is not None and state.get("session_id"):
-        assistant.session_id = state["session_id"]
+    if assistant is not None:
+        # 続きは復元した会話を文脈として渡すので、session_id の resume には頼らない
+        # (Gemini セッションは再起動で消えるため。chat_log があれば recent_context で続けられる)
+        assistant.session_id = None
+        if state.get("security_thread"):
+            assistant._security_thread = True
+            # 直後の発言で 10分ルールにより security_thread が即リセットされないようにする
+            assistant.last_used = time.time()
     restored = True
 
 
@@ -1374,7 +1425,49 @@ def weather_watcher():
         threading.Event().wait(1800)
 
 
+HEALTH_CHECK_INTERVAL = 180  # 3分ごとに会話の調子をチェックする
+
+
+def conversation_health_monitor():
+    """定期的に聞き取りの調子を見て、スムーズにやり取りできるよう待ち時間やマイク感度を自動で調整する。
+    自動操作の最中は、実況や操作を乱さないよう調整しない (落ち着いてからの回に回す)。"""
+    global PAUSE_THRESHOLD, last_calibrated
+    while True:
+        threading.Event().wait(HEALTH_CHECK_INTERVAL)
+        if operate_stop is not None or no_barge_in.is_set():
+            continue  # 自動操作中は触らない。カウンタは残して、落ち着いた次の回に判断する
+        with recog_stats_lock:
+            ok, unknown, stitched = recog_stats["ok"], recog_stats["unknown"], recog_stats["stitched"]
+        total = ok + unknown
+        if total < 4:
+            continue  # サンプルが少ないと調整が暴れるので見送る (カウンタは貯めたまま)
+        with recog_stats_lock:
+            recog_stats.update(ok=0, unknown=0, stitched=0)
+        miss_rate = unknown / total
+        note = None
+        if miss_rate >= 0.4:  # 聞き取れない率が高い → 雑音/感度の問題。測り直して、間も少し延ばす
+            last_calibrated = 0  # 次の聞き取りでマイクを測り直す
+            if PAUSE_THRESHOLD < 10.0:
+                PAUSE_THRESHOLD = round(min(10.0, PAUSE_THRESHOLD + 1.0), 1)
+                recognizer.pause_threshold = PAUSE_THRESHOLD
+                note = f"聞き取れないことが多めなので、待ち時間を{PAUSE_THRESHOLD}秒に延ばし、マイクを測り直します"
+            else:
+                note = "聞き取れないことが多めなので、マイクを測り直します"
+        elif stitched >= 2 and stitched * 2 >= ok and PAUSE_THRESHOLD < 10.0:  # 文がよく途中で切れる → もっと待つ
+            PAUSE_THRESHOLD = round(min(10.0, PAUSE_THRESHOLD + 1.0), 1)
+            recognizer.pause_threshold = PAUSE_THRESHOLD
+            note = f"文の途中で切れがちなので、待ち時間を{PAUSE_THRESHOLD}秒に延ばします"
+        elif miss_rate <= 0.05 and stitched == 0 and PAUSE_THRESHOLD > 5.0:  # とても順調 → 間を詰めて反応を速く
+            PAUSE_THRESHOLD = round(max(5.0, PAUSE_THRESHOLD - 0.5), 1)
+            recognizer.pause_threshold = PAUSE_THRESHOLD
+            note = f"調子がよいので、待ち時間を{PAUSE_THRESHOLD}秒に詰めて反応を速くします"
+        if note:
+            save_settings(pause_threshold=PAUSE_THRESHOLD)
+            log(f"会話チェック: {note} (直近 聞き取り{ok}・聞き取れず{unknown}・継ぎ足し{stitched})")
+
+
 threading.Thread(target=weather_watcher, daemon=True).start()
+threading.Thread(target=conversation_health_monitor, daemon=True).start()  # 会話の調子を見て自動調整
 threading.Thread(target=cleanup.daily, args=(log,), daemon=True).start()  # 1日1回のお掃除
 
 
@@ -1731,7 +1824,8 @@ def layout(event=None):
 
 
 canvas.bind("<Configure>", layout)
-restore_state()  # 再起動前の会話があれば復元する
+restore_state()  # 再起動前の会話があれば復元する (この後で自動保存を始める。順序が逆だと上書きしてしまう)
+threading.Thread(target=autosave_restart_state, daemon=True).start()  # 強制終了でも会話が残るよう定期保存
 show_info("話しかけるか、下の欄に入力してください。\n"
           "例: 「今日の天気は？」「ニュースを読んで」「XSS の対策をまとめて」\n"
           "「memory_store.py を分析して」のような長い作業も頼めます (作業モード)。\n"

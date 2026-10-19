@@ -41,7 +41,7 @@ OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 # これらは Gemini がサーバー側の安全ポリシーで一律に断り、断り文を“正常な回答”として返してしまうため、
 # 認可済みの学習作業に対応できる Claude を先に使う (通常の会話・操作は従来どおり無料の Gemini を優先する)。
 _SECURITY_MARKERS = (
-    "tryhackme", "try hack me", "ハックミー", "はっくみー", "hackthebox", "hack the box",
+    "tryhackme", "try hack me", "トライハック", "ハックミー", "はっくみー", "hackthebox", "hack the box",
     "ctf", "ペネトレーション", "ペンテス", "脆弱", "エクスプロイト", "exploit", "payload",
     "ポートスキャン", "nmap", "hydra", "総当たり", "ブルートフォース", "brute",
     "権限昇格", "privilege", "privesc", "リバースシェル", "reverse shell",
@@ -390,6 +390,17 @@ OPERATE_PROMPT = """あなたは音声アシスタント「ジャービス」(�
         入力が入らない→click-type で「クリックと入力」を1回でまとめて行う(click-screenとtype-textを分けるとカーソルが外れる) / --replace で入れ直す / リモート端末なら --scan で打つ。
         ページが出ない→少し待って見直す / f5 で再読み込み / open-url で開き直す)。
    行き詰まったら、状況を報告してよい (下の「報告のしかた」に従う)
+5. 答えを入力する問題 (TryHackMe の Check 欄など) では、送信したら必ず read-screen で結果を確かめる。
+   緑のチェックや「Correct」など “正解” の表示を確認できて初めて次に進む。正解が確認できないうちは終わらせない。
+   間違い・不正解のとき (赤い！のまま、「Incorrect」「That's not the right answer」、
+   「Uh-oh! The answer you provided may not be in English」など) は、同じ答えを入れ直して繰り返さない。
+   自分で気づいて別の答えを探しに行く:
+   (a) 入力欄のヒントを読む。下線の数は文字数、「.___」は .exe のような拡張子、下線の間の空白は語の区切り
+       (例: 「________ ____」は『Windows User』のように2語)。全角や余計な空白が混じっていないかも確かめる。
+   (b) それでも分からなければ WebSearch で「ルーム名 + 問題文 (または walkthrough)」を調べ、
+       正しい答えの候補を見つける (例「TryHackMe Windows Fundamentals 2 Control Panel command」)。
+   (c) 前と違う答えを --replace で入れ直して Check し、また結果を確かめる。正解になるまで (a)〜(c) を繰り返す。
+   同じ答えで2回続けて弾かれたら、必ずやり方か答えそのものを変える。無闇に3回以上同じ入力を繰り返さない
 
 答えを見つけたら、その場で知らせる:
 - 目標の答え (フラグ、パスワード、ユーザー名、問題の答え、ログイン成功など、ユーザーが欲しい結果) が分かった瞬間に、
@@ -556,6 +567,10 @@ class Assistant:
         self.work_session_id = None  # 作業モードの会話 (続けて頼めるように)
         self.last_work = 0
         self.operate_session_id = None  # 自動操作の会話 (時間切れでも続きから再開できるように)
+        # セキュリティ学習(CTF/TryHackMe)のやり取りが続いている間は、短い続きの依頼
+        # (「探して」「別の答えを試して」など、言葉だけでは判別できないもの) も Claude を使い続ける。
+        # 10分以上空いて会話がリセットされたら False に戻す。
+        self._security_thread = False
         # 途中で止まった改修があれば再開情報を読み込む {"session_id":..., "request":...}
         try:
             self.dev_resume = json.loads(DEV_RESUME_FILE.read_text(encoding="utf-8"))
@@ -1029,8 +1044,11 @@ class Assistant:
         if time.time() - self.last_used > IDLE_RESET_SECONDS:
             self.session_id = None  # 新しい会話
             self._gemini_sessions.pop("chat", None)
+            self._security_thread = False  # 会話が切れたらセキュリティ学習の継続判定もリセット
         self.last_used = time.time()
         self._current_channel = "chat"
+        if _is_security_request(text, context):
+            self._security_thread = True
 
         system = SYSTEM.format(marker=DEV_MARKER, today=datetime.now().strftime("%Y年%m月%d日"),
                                memory=load_memory(), records=_memory_context_for_prompt(text))
@@ -1043,8 +1061,10 @@ class Assistant:
                 "--allowedTools", "Bash(python jarvis_tools.py:*)", "Read(attachments/**)"]
         if self.session_id:
             args += ["--resume", self.session_id]  # 会話の続き
+        # セキュリティ学習(CTF/TryHackMe)のやり取りが続いている間は、会話での質問や短い依頼も
+        # Gemini に断られないよう Claude を先に使う (通常の会話は従来どおり無料の Gemini を優先)。
         try:
-            data = self._run(args, TIMEOUT_SECONDS)
+            data = self._run_stream(args, TIMEOUT_SECONDS, prefer_claude=self._security_thread)
         except Exception:
             self.session_id = None
             raise
@@ -1067,9 +1087,11 @@ class Assistant:
             extra = []
         prompt = with_images(prompt, images)
         allowed = ["Read", "Glob", "Grep", "Edit(docs/**)", "Write(docs/**)", "Bash(python jarvis_tools.py:*)"]
-        # セキュリティ学習の作業は Gemini が断るので Claude を先に使う。続きの依頼 (request が短いとき) は、
-        # 前回が Claude のセッションなら引き継いで Claude を使う (別プロバイダの --resume は噛み合わないため)。
-        prefer_claude = _is_security_request(request) or (
+        # セキュリティ学習の作業は Gemini が断り、Ollama では答えが不正確なので Claude を先に使う。
+        # 続きの短い依頼 (「探して」など) も、セキュリティ学習のやり取りが続いている間は Claude を使い続ける。
+        if _is_security_request(request):
+            self._security_thread = True
+        prefer_claude = self._security_thread or (
             bool(extra) and self.work_session_id
             and not str(self.work_session_id).startswith(("gemini:", "ollama:")))
         data = self._run_stream([prompt, "--tools", "Read,Glob,Grep,Edit,Write,Bash", "--allowedTools", *allowed,
@@ -1123,8 +1145,11 @@ class Assistant:
                 self.operate_session_id = sid
 
         # セキュリティ学習・CTF の自動操作は Gemini/Ollama が断るので Claude を先に使う。
-        # 続き (resume) のときは goal が空になりがちなので、前回が Claude のセッションなら引き継いで Claude を使う。
-        prefer_claude = _is_security_request(goal, context) or (
+        # 続きの短い依頼 (「別の答えを探して」など) は言葉だけでは判別できないので、
+        # セキュリティ学習のやり取りが続いている間 (_security_thread) はそのまま Claude を使い続ける。
+        if _is_security_request(goal, context):
+            self._security_thread = True
+        prefer_claude = self._security_thread or (
             resume and self.operate_session_id
             and not str(self.operate_session_id).startswith(("gemini:", "ollama:")))
         try:
