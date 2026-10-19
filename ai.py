@@ -36,6 +36,28 @@ LOCAL_RUNTIME_MODEL = os.environ.get(
     f"{LOCAL_MODEL.rsplit(':', 1)[0]}:{LOCAL_MODEL.rsplit(':', 1)[1]}-jarvis-4k"
     if ":" in LOCAL_MODEL else f"{LOCAL_MODEL}:jarvis")
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+
+# セキュリティ学習・CTF (TryHackMe など、ユーザー自身が起動した認可済みターゲット) の依頼を見分ける印。
+# これらは Gemini がサーバー側の安全ポリシーで一律に断り、断り文を“正常な回答”として返してしまうため、
+# 認可済みの学習作業に対応できる Claude を先に使う (通常の会話・操作は従来どおり無料の Gemini を優先する)。
+_SECURITY_MARKERS = (
+    "tryhackme", "try hack me", "ハックミー", "はっくみー", "hackthebox", "hack the box",
+    "ctf", "ペネトレーション", "ペンテス", "脆弱", "エクスプロイト", "exploit", "payload",
+    "ポートスキャン", "nmap", "hydra", "総当たり", "ブルートフォース", "brute",
+    "権限昇格", "privilege", "privesc", "リバースシェル", "reverse shell",
+    "kali", "openvpn", "attackbox", "metasploit", "msfconsole", "gobuster", ".thm",
+)
+
+
+def _is_security_request(*texts):
+    """渡された依頼文のどれかに、セキュリティ学習・CTF を示す言葉が含まれていれば True。
+    音声認識はカタカナを区切りがちなので (例「トライ ハック ミー」)、空白を除いた形でも照合する。"""
+    joined = " ".join(str(t) for t in texts if t).lower()
+    squished = re.sub(r"\s+", "", joined)
+    return any(marker in joined or marker.replace(" ", "") in squished
+               for marker in _SECURITY_MARKERS)
+
+
 IDLE_RESET_SECONDS = 600    # 10分話しかけなければ新しい会話にする
 TIMEOUT_SECONDS = 600       # 会話の1ターン。ポートスキャンなど時間のかかる道具を数回使っても収まるよう長め
 DEV_TIMEOUT_SECONDS = 900   # プログラムの書き換えは時間がかかる
@@ -704,9 +726,23 @@ class Assistant:
         result["provider"] = "claude"
         return result
 
-    def _run_stream(self, args, timeout, on_progress=None, on_session=None, should_stop=None):
-        """Prefer free Gemini, then local Ollama, and use Claude only when needed."""
+    def _run_stream(self, args, timeout, on_progress=None, on_session=None, should_stop=None,
+                    prefer_claude=False):
+        """Prefer free Gemini, then local Ollama, and use Claude only when needed.
+        prefer_claude=True のときは Claude を先に試す (Gemini/Ollama が断るセキュリティ学習の依頼向け)。
+        Claude が使えない・失敗したときは、従来どおり Gemini → Ollama に切り替える。"""
         last_error = None
+        if prefer_claude and self.exe:
+            try:
+                return self._run_claude_stream(args, timeout, on_progress, on_session, should_stop)
+            except OperationInterrupted:
+                raise
+            except Exception as error:
+                if getattr(error, "side_effect_started", False):
+                    raise
+                last_error = error
+                if on_progress:
+                    on_progress("Claudeが使えないため、ほかのAIを試します")
         if self.gemini:
             try:
                 return self._run_gemini_stream(args, timeout, on_progress, on_session, should_stop)
@@ -739,7 +775,7 @@ class Assistant:
                     raise
                 last_error = error
 
-        if self.exe:
+        if self.exe and not prefer_claude:
             try:
                 if on_progress:
                     on_progress("無料のAIが使えないため、Claude Codeを試します")
@@ -1031,8 +1067,13 @@ class Assistant:
             extra = []
         prompt = with_images(prompt, images)
         allowed = ["Read", "Glob", "Grep", "Edit(docs/**)", "Write(docs/**)", "Bash(python jarvis_tools.py:*)"]
+        # セキュリティ学習の作業は Gemini が断るので Claude を先に使う。続きの依頼 (request が短いとき) は、
+        # 前回が Claude のセッションなら引き継いで Claude を使う (別プロバイダの --resume は噛み合わないため)。
+        prefer_claude = _is_security_request(request) or (
+            bool(extra) and self.work_session_id
+            and not str(self.work_session_id).startswith(("gemini:", "ollama:")))
         data = self._run_stream([prompt, "--tools", "Read,Glob,Grep,Edit,Write,Bash", "--allowedTools", *allowed,
-                                 *extra], WORK_TIMEOUT_SECONDS, on_progress)
+                                 *extra], WORK_TIMEOUT_SECONDS, on_progress, prefer_claude=prefer_claude)
         self.work_session_id, self.last_work = data.get("session_id"), time.time()
         reply = (data.get("result") or "").strip() or "作業が終わりました。"
         made = sorted(set(DOCS_DIR.glob("*.md")) - before, key=lambda p: p.stat().st_mtime)
@@ -1081,11 +1122,16 @@ class Assistant:
             if sid and (not self.operate_session_id or self.operate_session_id.startswith(("gemini:", "ollama:"))):
                 self.operate_session_id = sid
 
+        # セキュリティ学習・CTF の自動操作は Gemini/Ollama が断るので Claude を先に使う。
+        # 続き (resume) のときは goal が空になりがちなので、前回が Claude のセッションなら引き継いで Claude を使う。
+        prefer_claude = _is_security_request(goal, context) or (
+            resume and self.operate_session_id
+            and not str(self.operate_session_id).startswith(("gemini:", "ollama:")))
         try:
             data = self._run_stream([prompt, "--tools", "Bash,Read,WebSearch,WebFetch",
                                      "--allowedTools", *allowed, *extra],
                                     OPERATE_TIMEOUT_SECONDS, on_progress, on_session=on_session,
-                                    should_stop=should_stop)
+                                    should_stop=should_stop, prefer_claude=prefer_claude)
         except subprocess.TimeoutExpired:
             raise  # 時間切れは do_operate 側で「続きから再開できます」と伝える
         if data.get("session_id") and (not self.operate_session_id or

@@ -2,6 +2,7 @@ edge-tts
 feedparser
 ddgs
 numpy
+opencv-python-headless
 Pillow
 PyAudio
 pywin32
