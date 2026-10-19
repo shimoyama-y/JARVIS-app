@@ -673,9 +673,12 @@ WORK_WORDS = ("分析", "設計", "レポート", "調査", "実装", "修正し
 # (不可逆な操作はしない安全設計で、途中は名前を呼ぶか「止めて」で中断できるので、毎回の開始確認はしない)
 OPERATE_WORDS = ("自動で", "自動操作", "自動モード", "全部やって", "ぜんぶやって", "最後までやって",
                  "自分で操作", "自分でやって", "代わりに操作", "代わりにやって", "自動でやって", "画面を操作して",
-                 # 画面(タブ・ウィンドウ)を片付ける依頼も、画面操作なので自動操作モードで処理する
+                 # 画面(タブ・ウィンドウ・ブラウザ)を片付ける依頼も、実際の画面操作なので自動操作モードで処理する
+                 # (調査モードに回ると「閉じる」代わりにレポートを書くだけで、実際には閉じられないため)
                  "片付けて", "かたづけて", "整理して進めて", "整理して続けて", "画面を整理", "タブを整理",
-                 "タブを閉じ", "ウィンドウを閉じ", "閉じて整理", "開きっぱなし")
+                 "タブを閉じ", "ウィンドウを閉じ", "閉じて整理", "開きっぱなし", "クローズ",
+                 "ブラウザを閉じ", "ブラウザは閉じ", "ブラウザを整理", "不要なタブ", "不要なブラウザ",
+                 "不要なウィンドウ", "いらないタブ", "いらないブラウザ", "余計なブラウザ", "余計なタブ")
 # n8n ワークフローを作る依頼の合図。これらが来たら Claude に n8n ワークフローJSONを作らせて取り込む
 WORKFLOW_WORDS = ("ワークフロー", "n8n", "エヌエイトエヌ", "自動化を作", "自動化作", "自動化のフロー", "フローを作")
 pending_dev = None  # 作業モードで「プログラムの変更が必要」となった依頼 (「はい」を待っている)
@@ -1267,9 +1270,72 @@ def speak_notice():
             speak(text)
 
 
+def _proxy_warning():
+    """バープなどが Windows のプロキシを有効にしていると HTTPS 通信が失敗しやすいので、
+    有効なら一言そえる (無効ならなにも言わない)。"""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        try:
+            enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        finally:
+            winreg.CloseKey(key)
+        if enable and server:
+            return f"ただ、プロキシ {server} が有効なので、通信がうまくいかないことがあります。"
+    except OSError:
+        pass
+    return ""
+
+
+def startup_system_check():
+    """起動時に、使えるAIと通信まわりをざっと確認して、声で伝える一言にする。"""
+    if assistant is None:
+        return "ただ、AIの準備ができていないようです。設定を確認してください。"
+    avail = []
+    if assistant.gemini:
+        avail.append("ジェミニ")
+    try:
+        if assistant._local_model_ready():
+            avail.append("ローカルAI")
+    except Exception:
+        pass
+    if assistant.exe:
+        avail.append("クロード")
+    status = ("使えるAIは、" + "、".join(avail) + "です。") if avail else "使えるAIが見つかりませんでした。"
+    warn = _proxy_warning()
+    log(f"起動時システムチェック: AI={avail or 'なし'} / proxy={'警告あり' if warn else 'OK'}")
+    return "システムを確認しました。" + status + warn
+
+
+def _last_topic():
+    """復元した会話から、直前にユーザーが話していた話題を一言で拾う (あいさつで触れるため)。"""
+    for who, text in reversed(chat_log):
+        if who in ("あなた", "スマホ"):
+            t = " ".join(str(text).split())
+            if t:
+                return t[:40]
+    return ""
+
+
 def greet():
-    """最初のあいさつ。再起動直後は前の会話の続きだと分かる一言にする"""
-    speak("再起動が終わりました。続きのお話をどうぞ。" if restored else GREETING)
+    """最初のあいさつ。起動時にまずシステムチェックと前の会話の確認をしてから、それをもとに話し始める。"""
+    # 起動あいさつの流れ: ①システムチェック結果 → ②直近の会話の確認 →
+    # ③その続きを進めるか、別のことをするかの問いかけ。
+    check = startup_system_check()
+    if restored:
+        topic = _last_topic()
+        if topic:
+            say = (f"おかえりなさい。{check}さっきは、{topic}、というお話でしたね。"
+                   "この続きを進めますか。それとも、別のことをしますか。")
+        else:
+            say = (f"おかえりなさい。{check}さっきの続きがあります。"
+                   "続きを進めますか。それとも、別のことをしますか。")
+    else:
+        say = f"{GREETING}{check}今日は何をしましょうか。"
+    add_chat("JARVIS", say)
+    speak(say)
     speak_notice()
     if assistant is not None and assistant.dev_resume:  # 前回の改修が途中で止まっていたら知らせる
         speak("前回の改修が途中で止まっています。続きをやって、と言っていただければ、続きから進めます。")
@@ -1466,8 +1532,29 @@ def conversation_health_monitor():
             log(f"会話チェック: {note} (直近 聞き取り{ok}・聞き取れず{unknown}・継ぎ足し{stitched})")
 
 
+def daily_usage_report():
+    """毎日18時に、その日のAI使用量 (何にトークンを使ったか) を自動で報告する。
+    自動操作の最中は邪魔しないよう、18時台のうちに落ち着いたタイミングで報告する。"""
+    last_date = None
+    while True:
+        threading.Event().wait(60)  # 1分ごとに時刻を確認
+        now = datetime.now()
+        if now.hour == 18 and last_date != now.date():
+            if operate_stop is not None or no_barge_in.is_set():
+                continue  # 自動操作中は触らない。次の1分で再挑戦する
+            last_date = now.date()
+            try:
+                say, show = features.usage_report()
+                add_chat("JARVIS", say)
+                ui(show_info, show)
+                speak(say)
+            except Exception as e:
+                log(f"使用量レポートの自動報告に失敗: {e!r}")
+
+
 threading.Thread(target=weather_watcher, daemon=True).start()
 threading.Thread(target=conversation_health_monitor, daemon=True).start()  # 会話の調子を見て自動調整
+threading.Thread(target=daily_usage_report, daemon=True).start()  # 毎日18時にAI使用量を報告
 threading.Thread(target=cleanup.daily, args=(log,), daemon=True).start()  # 1日1回のお掃除
 
 

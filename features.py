@@ -1212,6 +1212,64 @@ def _log_automation(text):
         f.write(f"{time.strftime('%m-%d %H:%M:%S')} 画面操作: {text}\n")
 
 
+# AIの使用量レポート。jarvis.log に残る目印から、何にAIを使ったかを集計する。
+# パソコン側では Claude Pro の正確なトークン数は取れないので、活動ベースの推定。
+_USAGE_LINE = re.compile(r"^(\d{2}-\d{2}) \d{2}:\d{2}:\d{2} (.*)$")
+_USAGE_MARKERS = {
+    "user": re.compile(r"あなた.*?: "),              # ユーザーの発言(声/チャット)
+    "operate": re.compile(r"では、始めますね"),         # 自動操作モードの開始
+    "work": re.compile(r"作業しますね"),               # 作業(調査)モードの開始
+    "dev": re.compile(r"自動改修|変更が終わりました"),    # 開発(プログラム改修)
+    "to_ollama": re.compile(r"Geminiが使えないため"),    # 無料AI(Gemini)→ローカルAI(Ollama)へ切替
+    "to_claude": re.compile(r"無料のAIが使えないため"),   # 無料AI不可→Claudeへ切替
+    "ollama": re.compile(r"ローカルAI"),               # ローカルAI(Ollama)が稼働
+    "limit": re.compile(r"session limit|利用上限|hit your session"),  # Claude Pro の上限に到達
+    "error": re.compile(r"エラー"),                     # 何らかのエラー
+}
+
+
+def usage_report(day=None):
+    """jarvis.log を集計して、今日(または MM-DD 指定日)にAIを何に使ったかを報告する。
+    (読み上げる要約, 画面に出す内訳) を返す。正確なトークン数は取得できないため、
+    ログに残る活動ベースの推定。"""
+    day = day or time.strftime("%m-%d")
+    counts = {name: 0 for name in _USAGE_MARKERS}
+    try:
+        lines = AUTOMATION_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "ログが読めなかったので、使用量をお伝えできません。", "■ AI使用量\nログが読めませんでした"
+    for raw in lines:
+        m = _USAGE_LINE.match(raw)
+        if not m or m.group(1) != day:
+            continue
+        body = m.group(2)
+        for name, pat in _USAGE_MARKERS.items():
+            if pat.search(body):
+                counts[name] += 1
+    total = counts["user"]
+    chat = max(0, total - counts["operate"] - counts["work"])
+    heavy = counts["operate"] + counts["work"] + counts["dev"]
+    if total == 0:
+        return (f"今日はまだ、AIとのやり取りがありません。",
+                f"■ AI使用量レポート {day}\nまだやり取りがありません")
+    say = (f"今日はAIと合計{total}回やり取りしました。"
+           f"会話が{chat}回、自動操作が{counts['operate']}回、調べ物が{counts['work']}回です。")
+    if counts["limit"]:
+        say += (f"重い処理でクロードの利用上限に{counts['limit']}回当たりましたが、"
+                "ふだんの会話は無料のAIでまかなえています。")
+    else:
+        say += "利用上限には当たっていません。ふだんの会話は無料のAIが中心です。"
+    show = (f"■ AI使用量レポート {day} (活動ベースの推定)\n"
+            f"やり取り合計: {total} 回\n"
+            f"  会話 {chat} / 自動操作 {counts['operate']} / 調べ物 {counts['work']} / 開発 {counts['dev']}\n"
+            f"無料AI→ローカルAI 切替: {counts['to_ollama']} 回 / ローカルAI稼働: {counts['ollama']} 回\n"
+            f"無料AI不可→Claude 切替: {counts['to_claude']} 回\n"
+            f"Claude Pro 上限到達: {counts['limit']} 回 / エラー全体: {counts['error']} 回\n"
+            f"重い処理(自動操作+調べ物+開発)={heavy} 回 は主に Claude(Pro枠)を使います\n"
+            f"※ 正確なトークン数はパソコン側で取得できないため推定です")
+    return say, show
+
+
 @contextlib.contextmanager
 def _dpi_aware():
     """この処理の間だけ、スレッドを Per-Monitor v2 の DPI 認識に切り替える。

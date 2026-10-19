@@ -69,6 +69,8 @@
   python jarvis_tools.py system-log 24 all   (2つめの引数を all にすると、警告レベルも含めて調べる)
   python jarvis_tools.py check-security      (このPCの基本的な脆弱性チェック。OS情報と最終起動時刻、
     Windows Defenderの状態、ファイアウォールの状態、開いているポートと待ち受けプロセスを取得する)
+  python jarvis_tools.py usage-report        (今日、AIを何にどれだけ使ったかを集計して報告する。
+    「何でトークン使った」「AIの使用量」などで使う。日付を MM-DD で指定もできる。毎日18時に自動でも報告する)
 
 結果は「読み上げ用の文」と「画面表示用の文」を出力する。
 画面表示用の文は SHOW: で始まる行以降に出す (JARVIS が画面に表示する)。
@@ -271,6 +273,9 @@ def main(args):
         return features.get_system_log(hours, level)
     if cmd == "check-security":  # このPCの基本的な脆弱性チェック (OS情報・Defender・ファイアウォール・開いているポート)
         return features.check_pc_security()
+    if cmd == "usage-report":  # 今日(または指定日 MM-DD)、AIを何にどれだけ使ったかを集計して報告する
+        day = args[1] if len(args) >= 2 and len(args[1]) == 5 and args[1][2] == "-" else None
+        return features.usage_report(day)
     return None
 
 
